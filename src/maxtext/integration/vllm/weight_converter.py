@@ -274,6 +274,9 @@ class WeightConverter:
       debug: bool = False,
       prefuse_moe_weights: Optional[bool] = None,
       target_dtype: Optional[Any] = None,
+      dst_rule: Optional[Union[str, Mapping[str, Any]]] = None,
+      hf_prefix: str = "model",
+      hf_vocab_size: Optional[int] = None,
   ):
     config = trainer_config if config is None else config
     if rules is not None and not rules:
@@ -283,14 +286,38 @@ class WeightConverter:
           "MaxText-to-MaxText path, or a non-empty rule list."
       )
     self.rules = rules
+    self.config = config
+    self.tp = resolve_rollout_tp(config, tp)
+    self.kv_tp_size = kv_tp_size if kv_tp_size is not None else (getattr(config, "kv_tp_size", None) or self.tp)
+    self.moe_mlp_tp_size = (
+        moe_mlp_tp_size if moe_mlp_tp_size is not None else (getattr(config, "moe_mlp_tp_size", None) or self.tp)
+    )
 
     # Read by the rollout engine to decide whether to trace the reshard
     # step that runs after conversion.
     self.debug = debug
     self.rollout_backend = rollout_backend
 
+    self._dst_rule: Optional[Dict[str, Any]] = None
+    self._hf_prefix = hf_prefix
+    self._hf_vocab_size = hf_vocab_size
+    self._declarative_jit_fn: Any = None
     self._direct: Optional["MaxTextToMaxTextConverter"] = None
-    if rollout_backend == "maxtext" and rules is None:
+
+    if dst_rule is not None:
+      from maxtext.integration.vllm.weight_mapping import validate_manifest
+
+      if config is None:
+        raise ValueError("WeightConverter(dst_rule=...) requires `config` to generate MaxText src_rule.")
+      self._dst_rule = validate_manifest(dst_rule)
+      logging.info(
+          "WeightConverter: declarative weight_mapping mode (%d dst rules, expert_axis_grouped=%s).",
+          len(self._dst_rule["rules"]),
+          self._dst_rule["expert_axis_grouped"],
+      )
+    elif rollout_backend == "vllm_torch" and rules is None:
+      logging.info("WeightConverter: vllm_torch declarative mode (awaiting dst_rule manifest via set_target_state).")
+    elif rollout_backend == "maxtext" and rules is None:
       if config is None:
         raise ValueError(
             "WeightConverter(rules=None) needs `config` to derive the "
@@ -346,6 +373,52 @@ class WeightConverter:
 
   def convert(self, src_pytree: Any, target_state: Any = None) -> Any:
     """Converts source weights pytree into target format using rules or direct converter."""
+    if self._dst_rule is None and isinstance(target_state, str) and '"weight_mapping"' in target_state:
+      from maxtext.integration.vllm.weight_mapping import validate_manifest
+
+      self._dst_rule = validate_manifest(target_state)
+      self._declarative_jit_fn = None
+      target_state = None
+
+    if self._dst_rule is not None:
+      from maxtext.integration.vllm.maxtext_manifest_generator import (
+          flatten_maxtext_state,
+          generate_maxtext_to_hf_manifest_dict,
+      )
+      from maxtext.integration.vllm.weight_mapping import from_hf_impl, to_hf_impl
+
+      flat_src = flatten_maxtext_state(src_pytree)
+      # Cast fp32 master weights to bf16 (preserving A_log as fp32) to match TorchTPU HBM buffers.
+      flat_src = {
+          k: (
+              v.astype(jnp.bfloat16)
+              if jnp.issubdtype(v.dtype, jnp.floating) and v.dtype != jnp.bfloat16 and not k.endswith(".A_log")
+              else v
+          )
+          for k, v in flat_src.items()
+      }
+      if self._declarative_jit_fn is None:
+        hf_prefix = self._hf_prefix
+        if hf_prefix == "model" and any(
+            sk.startswith("model.language_model.")
+            for r in self._dst_rule["rules"]
+            for sk in r["source_keys"]
+        ):
+          hf_prefix = "model.language_model"
+        src_rule = generate_maxtext_to_hf_manifest_dict(
+            self.config,
+            flat_src,
+            hf_prefix=hf_prefix,
+            hf_vocab_size=self._hf_vocab_size,
+            expert_axis_grouped=self._dst_rule["expert_axis_grouped"],
+        )
+        dst_rule = self._dst_rule
+        self._declarative_jit_fn = jax.jit(
+            lambda weights: from_hf_impl(dst_rule, to_hf_impl(src_rule, weights), mesh=None)
+        )
+      result = self._declarative_jit_fn(flat_src)
+      return _rekey_to_target(result, target_state) if target_state is not None else result
+
     if self.rollout_backend == "maxtext" and self.rules is None:
       return self._direct.convert(src_pytree, target_state=target_state)
 
