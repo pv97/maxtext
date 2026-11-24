@@ -2774,6 +2774,8 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     self._staged_metadata = None
     if self._raiden_sync:
       logging.vlog(1, "Trainer Raiden metrics: %s", self._raiden_sync.metrics())
+      if hasattr(self._raiden_sync, "release_buffers"):
+        self._raiden_sync.release_buffers()
     return True
 
   def close(self) -> None:

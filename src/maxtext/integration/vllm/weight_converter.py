@@ -299,9 +299,9 @@ class WeightConverter:
     self.rollout_backend = rollout_backend
 
     self._dst_rule: Optional[Dict[str, Any]] = None
+    self._src_rule: Optional[Dict[str, Any]] = None
     self._hf_prefix = hf_prefix
     self._hf_vocab_size = hf_vocab_size
-    self._declarative_jit_fn: Any = None
     self._direct: Optional["MaxTextToMaxTextConverter"] = None
 
     if dst_rule is not None:
@@ -373,11 +373,12 @@ class WeightConverter:
 
   def convert(self, src_pytree: Any, target_state: Any = None) -> Any:
     """Converts source weights pytree into target format using rules or direct converter."""
-    if self._dst_rule is None and isinstance(target_state, str) and '"weight_mapping"' in target_state:
-      from maxtext.integration.vllm.weight_mapping import validate_manifest
+    if isinstance(target_state, str) and '"weight_mapping"' in target_state:
+      if self._dst_rule is None:
+        from maxtext.integration.vllm.weight_mapping import validate_manifest
 
-      self._dst_rule = validate_manifest(target_state)
-      self._declarative_jit_fn = None
+        self._dst_rule = validate_manifest(target_state)
+        self._src_rule = None
       target_state = None
 
     if self._dst_rule is not None:
@@ -388,16 +389,20 @@ class WeightConverter:
       from maxtext.integration.vllm.weight_mapping import from_hf_impl, to_hf_impl
 
       flat_src = flatten_maxtext_state(src_pytree)
-      # Cast fp32 master weights to bf16 (preserving A_log as fp32) to match TorchTPU HBM buffers.
+      # Cast master weights to match TorchTPU HBM dtypes (bf16, except A_log which is fp32).
       flat_src = {
           k: (
-              v.astype(jnp.bfloat16)
-              if jnp.issubdtype(v.dtype, jnp.floating) and v.dtype != jnp.bfloat16 and not k.endswith(".A_log")
-              else v
+              v.astype(jnp.float32)
+              if k.endswith(".A_log") and v.dtype != jnp.float32
+              else (
+                  v.astype(jnp.bfloat16)
+                  if jnp.issubdtype(v.dtype, jnp.floating) and v.dtype != jnp.bfloat16 and not k.endswith(".A_log")
+                  else v
+              )
           )
           for k, v in flat_src.items()
       }
-      if self._declarative_jit_fn is None:
+      if self._src_rule is None:
         hf_prefix = self._hf_prefix
         if hf_prefix == "model" and any(
             sk.startswith("model.language_model.")
@@ -405,18 +410,83 @@ class WeightConverter:
             for sk in r["source_keys"]
         ):
           hf_prefix = "model.language_model"
-        src_rule = generate_maxtext_to_hf_manifest_dict(
+        self._src_rule = generate_maxtext_to_hf_manifest_dict(
             self.config,
             flat_src,
             hf_prefix=hf_prefix,
             hf_vocab_size=self._hf_vocab_size,
             expert_axis_grouped=self._dst_rule["expert_axis_grouped"],
         )
-        dst_rule = self._dst_rule
-        self._declarative_jit_fn = jax.jit(
-            lambda weights: from_hf_impl(dst_rule, to_hf_impl(src_rule, weights), mesh=None)
-        )
-      result = self._declarative_jit_fn(flat_src)
+      # Capture trainer mesh before deleting flat_src so we can ensure converted
+      # tensors stay fully sharded across trainer HBM (avoiding accidental
+      # replication from reshape/concat ops when mesh=None).
+      trainer_mesh = next(
+          (
+              getattr(getattr(v, "sharding", None), "mesh", None)
+              for v in flat_src.values()
+              if getattr(getattr(v, "sharding", None), "mesh", None) is not None
+          ),
+          None,
+      )
+      # Execute per-op eagerly rather than caching a giant 40-layer monolithic
+      # jax.jit executable on TPU HBM (which adds ~40s compile + hundreds of MB
+      # of persistent HBM footprint during trainer fwd_bwd).
+      hf_weights = to_hf_impl(self._src_rule, flat_src)
+      del flat_src
+      result = from_hf_impl(self._dst_rule, hf_weights, mesh=None)
+      del hf_weights
+      if self.rollout_backend == "vllm_torch":
+        # Raiden binds only unique physical TPU buffers on model.get_language_model()
+        # (deduplicated by parameter identity / data_ptr, without the outer
+        # "language_model." wrapper prefix).
+        tied_dsts = {dst for _, dst in self._dst_rule.get("tied_keys", ())}
+        result = {
+            k.removeprefix("language_model.").removeprefix("model."): v
+            for k, v in result.items()
+            if k not in tied_dsts
+        }
+        if trainer_mesh is not None and trainer_mesh.size > 1:
+          active_axes = [ax for ax, sz in trainer_mesh.shape.items() if sz > 1]
+          sharded_result = {}
+          local_bytes = 0
+          for k, v in result.items():
+            if v.ndim >= 2:
+              spec = [None] * v.ndim
+              used_dims: set[int] = set()
+              remaining_axes: list[str] = []
+              for ax in active_axes:
+                sz = trainer_mesh.shape[ax]
+                placed = False
+                for d in range(v.ndim):
+                  if d not in used_dims and v.shape[d] % sz == 0:
+                    spec[d] = ax
+                    used_dims.add(d)
+                    placed = True
+                    break
+                if not placed:
+                  remaining_axes.append(ax)
+              if remaining_axes:
+                # Fold remaining axes onto any dim divisible by the combined factor.
+                for d in range(v.ndim):
+                  cur = (spec[d],) if isinstance(spec[d], str) else ()
+                  factor = 1
+                  for a in (*cur, *remaining_axes):
+                    factor *= trainer_mesh.shape[a]
+                  if v.shape[d] % factor == 0:
+                    spec[d] = (*cur, *remaining_axes) if cur or len(remaining_axes) > 1 else remaining_axes[0]
+                    break
+              if any(s is not None for s in spec):
+                v = jax.device_put(v, jax.sharding.NamedSharding(trainer_mesh, jax.sharding.PartitionSpec(*spec)))
+            sharded_result[k] = v
+            if hasattr(v, "addressable_shards") and v.addressable_shards:
+              local_bytes += v.addressable_shards[0].data.nbytes
+          result = sharded_result
+          logging.info(
+              "WeightConverter(vllm_torch): sharded %d tensors across trainer mesh %s (%.2f GiB/device).",
+              len(result),
+              {a: trainer_mesh.shape[a] for a in active_axes},
+              local_bytes / (1024 ** 3),
+          )
       return _rekey_to_target(result, target_state) if target_state is not None else result
 
     if self.rollout_backend == "maxtext" and self.rules is None:

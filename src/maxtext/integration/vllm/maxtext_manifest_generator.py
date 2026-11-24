@@ -200,8 +200,20 @@ def _emit_single_layer_rules(
 
   # GDN in_proj_ba: [D, H_k * 2 * V_per_K] -> (in_proj_b [H_v, D], in_proj_a [H_v, D])
   if subpath == "attention.in_proj_ba.kernel":
-    h_k = int(getattr(config, "gdn_conv_num_key_heads", getattr(config, "linear_num_key_heads", 0)))
-    h_v = int(getattr(config, "gdn_conv_num_value_heads", getattr(config, "linear_num_value_heads", 0)))
+    h_k = int(
+        getattr(
+            config,
+            "gdn_num_key_heads",
+            getattr(config, "gdn_conv_num_key_heads", getattr(config, "linear_num_key_heads", 0)),
+        )
+    )
+    h_v = int(
+        getattr(
+            config,
+            "gdn_num_value_heads",
+            getattr(config, "gdn_conv_num_value_heads", getattr(config, "linear_num_value_heads", 0)),
+        )
+    )
     v_per_k = h_v // h_k
     d_in = shape[0]
     ops = [
@@ -221,8 +233,20 @@ def _emit_single_layer_rules(
 
   # GDN in_proj_qkvz: [D, H_k * (2*D_k + 2*V_per_K*D_v)] -> (in_proj_qkv, in_proj_z)
   if subpath == "attention.in_proj_qkvz.kernel":
-    h_k = int(getattr(config, "gdn_conv_num_key_heads", getattr(config, "linear_num_key_heads", 0)))
-    h_v = int(getattr(config, "gdn_conv_num_value_heads", getattr(config, "linear_num_value_heads", 0)))
+    h_k = int(
+        getattr(
+            config,
+            "gdn_num_key_heads",
+            getattr(config, "gdn_conv_num_key_heads", getattr(config, "linear_num_key_heads", 0)),
+        )
+    )
+    h_v = int(
+        getattr(
+            config,
+            "gdn_num_value_heads",
+            getattr(config, "gdn_conv_num_value_heads", getattr(config, "linear_num_value_heads", 0)),
+        )
+    )
     d_k = int(getattr(config, "gdn_key_head_dim", getattr(config, "linear_key_head_dim", 0)))
     d_v = int(getattr(config, "gdn_value_head_dim", getattr(config, "linear_value_head_dim", 0)))
     v_per_k = h_v // h_k
@@ -270,6 +294,35 @@ def _emit_single_layer_rules(
   }
   if subpath in linear_2d_map:
     return [_rule([src_key], [linear_2d_map[subpath]], [{"transpose": {"axes": [1, 0]}}])]
+
+  # Pre-fused Routed MoE gate+up: [E, D, 2*F] -> (gate_proj [E, F, D], up_proj [E, F, D])
+  if subpath in ("mlp.routed_experts.wi", "moe_block.wi"):
+    num_e, _, double_f = shape
+    half_f = double_f // 2
+    if expert_axis_grouped:
+      return [
+          _rule(
+              [src_key],
+              [f"{lp}.mlp.experts.gate_proj.weight", f"{lp}.mlp.experts.up_proj.weight"],
+              [
+                  {"transpose": {"axes": [0, 2, 1]}},
+                  {"split": {"axis": 1, "sizes": [half_f, half_f]}},
+              ],
+          )
+      ]
+    g_tmp, u_tmp = f"__tmp__:{lp}:wi_g", f"__tmp__:{lp}:wi_u"
+    return [
+        _rule(
+            [src_key],
+            [g_tmp, u_tmp],
+            [
+                {"transpose": {"axes": [0, 2, 1]}},
+                {"split": {"axis": 1, "sizes": [half_f, half_f]}},
+            ],
+        ),
+        _rule([g_tmp], [f"{lp}.mlp.experts.{e}.gate_proj.weight" for e in range(num_e)], [{"unstack": {"axis": 0}}]),
+        _rule([u_tmp], [f"{lp}.mlp.experts.{e}.up_proj.weight" for e in range(num_e)], [{"unstack": {"axis": 0}}]),
+    ]
 
   # Routed MoE experts: [E, in, out] -> [E, out, in] (3D grouped) or E x [out, in] (2D)
   expert_map = {
@@ -370,7 +423,9 @@ def generate_maxtext_to_hf_manifest_dict(
       )
 
   for key, val in flat_state.items():
-    rel = key[len(root) :] if root and key.startswith(root) else key
+    rel = key
+    while rel.startswith(("params.", "base.")):
+      rel = rel.split(".", 1)[1]
     shape = tuple(int(d) for d in val.shape)
 
     if rel == "token_embedder.embedding":
@@ -410,7 +465,7 @@ def generate_maxtext_to_hf_manifest_dict(
     if dec_rel.startswith("layers.local_layers."):
       claimed.add(key)
       sub = dec_rel[len("layers.local_layers.") :]
-      is_exp = sub.startswith(("mlp.routed_experts.wi_", "mlp.routed_experts.wo", "moe_block.wi_", "moe_block.wo"))
+      is_exp = _normalize_subpath(sub).startswith(("mlp.routed_experts.wi", "mlp.routed_experts.wo"))
       ax0 = 1 if is_exp else scan_axis
       indices = [b * cycle + p for b in range(num_blocks) for p in range(cycle - 1)]
       _unroll_and_emit(key, sub, shape, indices, [ax0, ax0 + 1])
@@ -419,7 +474,7 @@ def generate_maxtext_to_hf_manifest_dict(
     if dec_rel.startswith("layers.global_layer."):
       claimed.add(key)
       sub = dec_rel[len("layers.global_layer.") :]
-      is_exp = sub.startswith(("mlp.routed_experts.wi_", "mlp.routed_experts.wo", "moe_block.wi_", "moe_block.wo"))
+      is_exp = _normalize_subpath(sub).startswith(("mlp.routed_experts.wi", "mlp.routed_experts.wo"))
       ax = 1 if is_exp else scan_axis
       indices = [b * cycle + (cycle - 1) for b in range(num_blocks)]
       _unroll_and_emit(key, sub, shape, indices, [ax])
@@ -428,7 +483,7 @@ def generate_maxtext_to_hf_manifest_dict(
     if dec_rel.startswith("layers_remainder.local_layers."):
       claimed.add(key)
       sub = dec_rel[len("layers_remainder.local_layers.") :]
-      is_exp = sub.startswith(("mlp.routed_experts.wi_", "mlp.routed_experts.wo", "moe_block.wi_", "moe_block.wo"))
+      is_exp = _normalize_subpath(sub).startswith(("mlp.routed_experts.wi", "mlp.routed_experts.wo"))
       ax = 1 if is_exp else scan_axis
       rem_start = num_blocks * cycle
       indices = list(range(rem_start, num_layers))
@@ -441,7 +496,7 @@ def generate_maxtext_to_hf_manifest_dict(
       claimed.add(key)
       slot = int(m_slot.group(1))
       sub = m_slot.group(2)
-      is_exp = _normalize_subpath(sub).startswith(("mlp.routed_experts.wi_", "mlp.routed_experts.wo"))
+      is_exp = _normalize_subpath(sub).startswith(("mlp.routed_experts.wi", "mlp.routed_experts.wo"))
       ax = 1 if is_exp else scan_axis
       indices = list(range(slot, num_layers, cycle))
       _unroll_and_emit(key, sub, shape, indices, [ax] if len(indices) > 1 or shape[ax] == len(indices) else [])
@@ -451,7 +506,7 @@ def generate_maxtext_to_hf_manifest_dict(
     if dec_rel.startswith("layers."):
       claimed.add(key)
       sub = dec_rel[len("layers.") :]
-      is_exp = sub.startswith(("mlp.routed_experts.wi_", "mlp.routed_experts.wo", "moe_block.wi_", "moe_block.wo"))
+      is_exp = _normalize_subpath(sub).startswith(("mlp.routed_experts.wi", "mlp.routed_experts.wo"))
       ax = 1 if is_exp else scan_axis
       _unroll_and_emit(key, sub, shape, list(range(num_layers)), [ax])
       continue
